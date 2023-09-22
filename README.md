@@ -9,10 +9,13 @@ Re-implement Fairseq models in the Huggingface-style
 - [x] en_dense_lm_125m
 - [ ] moe_15b
 
-Example usage:
+
+
+## 2. Example usage:
 
 ```python
 from lightfs.models import FSGPTForCausalLM
 
+# load `en_dense_lm_125m` from Huggingface model hub
 model = FSGPTForCausalLM.from_pretrained("Phando/fairseq-dense-125m")
 ```
