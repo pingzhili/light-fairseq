@@ -1,4 +1,4 @@
-# light-fairseq
+# Light Fairseq
 
 Re-implement Fairseq models in the Huggingface-style
 
