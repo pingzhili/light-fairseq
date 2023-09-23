@@ -101,7 +101,7 @@ def make_positions(tensor, padding_idx: int):
     return (torch.cumsum(mask, dim=1).type_as(mask) * mask).long() + padding_idx
 
 
-class SinusoidalPositionalEmbedding(nn.Module):
+class FSGPTSinusoidalPositionalEmbedding(nn.Module):
     """This module produces sinusoidal positional embeddings of any length.
 
     Padding symbols are ignored.
@@ -111,7 +111,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx if padding_idx is not None else 0
-        self.weights = SinusoidalPositionalEmbedding.get_embedding(
+        self.weights = FSGPTSinusoidalPositionalEmbedding.get_embedding(
             init_size, embedding_dim, padding_idx
         )
         self.onnx_trace = False
@@ -159,7 +159,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
         max_pos = self.padding_idx + 1 + seq_len
         if self.weights is None or max_pos > self.weights.size(0):
             # recompute/expand embeddings if needed
-            self.weights = SinusoidalPositionalEmbedding.get_embedding(
+            self.weights = FSGPTSinusoidalPositionalEmbedding.get_embedding(
                 max_pos, self.embedding_dim, self.padding_idx
             )
         self.weights = self.weights.to(self._float_tensor)
@@ -315,7 +315,7 @@ class FSGPTSelfAttention(nn.Module):
         return outputs  # a, present, (attentions)
 
 
-class FSGPTMlp(nn.Module):
+class FSGPTMLP(nn.Module):
     def __init__(self, config: FSGPTConfig, intermediate_size: int):
         super().__init__()
         self.fc1 = nn.Linear(config.hidden_size, intermediate_size)
@@ -338,7 +338,7 @@ class FSGPTBlock(nn.Module):
         inner_dim = config.intermediate_size if config.intermediate_size is not None else 4 * hidden_size
         self.self_attn = FSGPTSelfAttention(config)
         self.self_attn_layer_norm = nn.LayerNorm(hidden_size)
-        self.ffn = FSGPTMlp(config, inner_dim)
+        self.ffn = FSGPTMLP(config, inner_dim)
         self.final_layer_norm = nn.LayerNorm(hidden_size)
 
     def forward(
@@ -418,7 +418,7 @@ class FSGPTModel(FSGPTPreTrainedModel):
 
         self.embed_dim = config.hidden_size
         self.embed_tokens = nn.Embedding(config.vocab_size, self.embed_dim, padding_idx=config.pad_token_id)
-        self.embed_positions = SinusoidalPositionalEmbedding(
+        self.embed_positions = FSGPTSinusoidalPositionalEmbedding(
             embedding_dim=self.embed_dim,
             padding_idx=config.pad_token_id,
             init_size=config.max_position_embeddings + 1 + config.pad_token_id,
