@@ -6,3 +6,9 @@ from .fsgpt import (
     FSGPTModel,
     FSGPTConfig
 )
+
+from .fsgpt_moe import (
+    FSGPTMoEForCausalLM,
+    FSGPTMoEModel,
+    FSGPTMoEConfig
+)

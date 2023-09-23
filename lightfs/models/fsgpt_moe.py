@@ -2,14 +2,13 @@
 # @Author: pingzhili
 # @Time: 2023/9/18
 """
-Reproduce the Fairseq GPT dense model from arXiv:2112.10684
+Reproduce the Fairseq GPT model.
 
-Description from Fairseq paper:
-```
+Description from Fairseq:
 We differ from Brown et al. (2020) in two ways:
 (1) we use only dense attention, while they alternate between dense and locally banded sparse attention;
 (2) we train our models with sinusoidal positional embeddings, following Shortformer (Press et al., 2020).
-```
+
 
 """
 import math
@@ -22,11 +21,12 @@ from torch import Tensor, nn
 from torch.nn import CrossEntropyLoss
 from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
-from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast
+    MoEModelOutputWithPastAndCrossAttentions,
+    MoECausalLMOutputWithPast
 )
+
+from .fsgpt import FSGPTConfig
 
 
 def rename_fairseq_state_dict(
@@ -44,48 +44,69 @@ def rename_fairseq_state_dict(
     return convert_state_dict
 
 
-class FSGPTConfig(PretrainedConfig):
+class FSGPTMoEConfig(FSGPTConfig):
     def __init__(
             self,
-            vocab_size=51200,
-            max_position_embeddings=2048,
-            hidden_size=768,
-            num_layers=12,
-            num_heads=12,
-            intermediate_size=3072,
-            activation_function="gelu",
-            resid_dropout=0.1,
-            embed_dropout=0.0,
-            attention_dropout=0.1,
-            classifier_dropout=0.1,
-            use_cache=True,
-            pad_token_id=1,
-            eos_token_id=2,
-            unk_token_id=3,
-            no_scale_embedding=False,
+            sparse_step=2,
+            router_bias=False,
+            num_experts=512,
+            expert_capacity=None,
+            router_ignore_padding_tokens=True,
+            router_dtype="float32",
+            second_expert_policy="all",
+            normalize_router_prob_before_dropping=False,
+            batch_prioritized_routing=False,
+            moe_eval_capacity_token_fraction=-1.0,
+            moe_token_dropout=0.2,
+            output_router_logits=True,
             **kwargs,
     ):
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.intermediate_size = intermediate_size
-        self.activation_function = activation_function
-        self.resid_dropout = resid_dropout
-        self.embed_dropout = embed_dropout
-        self.attention_dropout = attention_dropout
-        self.classifier_dropout = classifier_dropout
-        self.use_cache = use_cache
+        self.sparse_step = sparse_step
+        self.router_bias = router_bias
+        self.num_experts = num_experts
+        self.expert_capacity = expert_capacity
+        self.router_ignore_padding_tokens = router_ignore_padding_tokens
+        self.router_dtype = router_dtype
+        self.second_expert_policy = second_expert_policy
+        self.normalize_router_prob_before_dropping = normalize_router_prob_before_dropping
+        self.batch_prioritized_routing = batch_prioritized_routing
+        self.moe_eval_capacity_token_fraction = moe_eval_capacity_token_fraction
+        self.moe_token_dropout = moe_token_dropout
+        self.output_router_logits = output_router_logits
 
-        self.pad_token_id = pad_token_id
-        self.eos_token_id = eos_token_id
-        self.unk_token_id = unk_token_id
+        super().__init__(**kwargs)
 
-        # Fairseq compatibility
-        self.no_scale_embedding = no_scale_embedding
 
-        super().__init__(pad_token_id=pad_token_id, eos_token_id=eos_token_id, unk_token_id=unk_token_id, **kwargs)
+def _make_causal_mask(
+        input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
+):
+    """
+    Make causal mask used for bi-directional self-attention.
+    """
+    bsz, tgt_len = input_ids_shape
+    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
+    mask_cond = torch.arange(mask.size(-1), device=device)
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+    mask = mask.to(dtype)
+
+    if past_key_values_length > 0:
+        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
+    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+
+
+# Copied from transformers.models.bart.modeling_bart._expand_mask
+def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+    """
+    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    """
+    bsz, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+
+    inverted_mask = 1.0 - expanded_mask
+
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
 def make_positions(tensor, padding_idx: int, offset: int):
@@ -101,7 +122,7 @@ def make_positions(tensor, padding_idx: int, offset: int):
     return (torch.cumsum(mask, dim=1).type_as(mask) * mask).long() + offset - 1
 
 
-class FSGPTSinusoidalPositionalEmbedding(nn.Module):
+class FSGPTMoESinusoidalPositionalEmbedding(nn.Module):
     """This module produces sinusoidal positional embeddings of any length.
 
     Padding symbols are ignored.
@@ -112,7 +133,7 @@ class FSGPTSinusoidalPositionalEmbedding(nn.Module):
         self.offset = 2
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx if padding_idx is not None else 0
-        self.weights = FSGPTSinusoidalPositionalEmbedding.get_embedding(
+        self.weights = FSGPTMoESinusoidalPositionalEmbedding.get_embedding(
             num_positions + self.offset, embedding_dim, self.offset
         )
         self.onnx_trace = False
@@ -160,7 +181,7 @@ class FSGPTSinusoidalPositionalEmbedding(nn.Module):
         max_pos = self.offset + seq_len
         if self.weights is None or max_pos > self.weights.size(0):
             # recompute/expand embeddings if needed
-            self.weights = FSGPTSinusoidalPositionalEmbedding.get_embedding(
+            self.weights = FSGPTMoESinusoidalPositionalEmbedding.get_embedding(
                 max_pos, self.embedding_dim, self.offset
             )
         self.weights = self.weights.to(self._float_tensor)
@@ -195,8 +216,8 @@ class FSGPTSinusoidalPositionalEmbedding(nn.Module):
         )
 
 
-class FSGPTSelfAttention(nn.Module):
-    def __init__(self, config: FSGPTConfig):
+class FSGPTMoESelfAttention(nn.Module):
+    def __init__(self, config: FSGPTMoEConfig):
         super().__init__()
 
         max_positions = config.max_position_embeddings
@@ -316,8 +337,165 @@ class FSGPTSelfAttention(nn.Module):
         return outputs  # a, present, (attentions)
 
 
-class FSGPTMLP(nn.Module):
-    def __init__(self, config: FSGPTConfig, intermediate_size: int):
+class FSGPTMoETop2Router(nn.Module):
+    """
+    Adapted form hugginfgace NLLB-MoE
+
+    Router using tokens choose top-2 experts assignment.
+
+    This router uses the same mechanism as in NLLB-MoE from the fairseq repository. Items are sorted by router_probs
+    and then routed to their choice of expert until the expert's expert_capacity is reached. **There is no guarantee
+    that each token is processed by an expert**, or that each expert receives at least one token.
+
+    The router combining weights are also returned to make sure that the states that are not updated will be masked.
+
+    """
+
+    def __init__(self, config: FSGPTMoEConfig):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.expert_capacity = config.expert_capacity
+        self.classifier = nn.Linear(config.hidden_size, self.num_experts, bias=config.router_bias)
+        self.router_ignore_padding_tokens = config.router_ignore_padding_tokens
+        self.dtype = getattr(torch, config.router_dtype)
+
+        self.second_expert_policy = config.second_expert_policy
+        self.normalize_router_prob_before_dropping = config.normalize_router_prob_before_dropping
+        self.batch_prioritized_routing = config.batch_prioritized_routing
+        self.moe_eval_capacity_token_fraction = config.moe_eval_capacity_token_fraction
+
+    def _cast_classifier(self):
+        r"""
+        `bitsandbytes` `Linear8bitLt` layers does not support manual casting Therefore we need to check if they are an
+        instance of the `Linear8bitLt` class by checking special attributes.
+        """
+        if not (hasattr(self.classifier, "SCB") or hasattr(self.classifier, "CB")):
+            self.classifier = self.classifier.to(self.dtype)
+
+    def normalize_router_probabilities(self, router_probs, top_1_mask, top_2_mask):
+        top_1_max_probs = (router_probs * top_1_mask).sum(dim=1)
+        top_2_max_probs = (router_probs * top_2_mask).sum(dim=1)
+        denom_s = torch.clamp(top_1_max_probs + top_2_max_probs, min=torch.finfo(router_probs.dtype).eps)
+        top_1_max_probs = top_1_max_probs / denom_s
+        top_2_max_probs = top_2_max_probs / denom_s
+        return top_1_max_probs, top_2_max_probs
+
+    def route_tokens(
+            self,
+            router_logits: torch.Tensor,
+            input_dtype: torch.dtype = torch.float32,
+            padding_mask: Optional[torch.LongTensor] = None,
+    ) -> Tuple:
+        """
+        Computes the `dispatch_mask` and the `dispatch_weights` for each experts. The masks are adapted to the expert
+        capacity.
+        """
+        nb_tokens = router_logits.shape[0]
+        # Apply Softmax and cast back to the original `dtype`
+        router_probs = nn.functional.softmax(router_logits, dim=-1, dtype=self.dtype).to(input_dtype)
+        top_1_expert_index = torch.argmax(router_probs, dim=-1)
+        top_1_mask = torch.nn.functional.one_hot(top_1_expert_index, num_classes=self.num_experts)
+
+        if self.second_expert_policy == "sampling":
+            gumbel = torch.distributions.gumbel.Gumbel(0, 1).rsample
+            router_logits += gumbel(router_logits.shape).to(router_logits.device)
+
+        # replace top_1_expert_index with min values
+        logits_except_top_1 = router_logits.masked_fill(top_1_mask.bool(), float("-inf"))
+        top_2_expert_index = torch.argmax(logits_except_top_1, dim=-1)
+        top_2_mask = torch.nn.functional.one_hot(top_2_expert_index, num_classes=self.num_experts)
+
+        if self.normalize_router_prob_before_dropping:
+            top_1_max_probs, top_2_max_probs = self.normalize_router_probabilities(
+                router_probs, top_1_mask, top_2_mask
+            )
+
+        if self.second_expert_policy == "random":
+            top_2_max_probs = (router_probs * top_2_mask).sum(dim=1)
+            sampled = (2 * top_2_max_probs) > torch.rand_like(top_2_max_probs.float())
+            top_2_mask = top_2_mask * sampled.repeat(self.num_experts, 1).transpose(1, 0)
+
+        if padding_mask is not None and not self.router_ignore_padding_tokens:
+            if len(padding_mask.shape) == 4:
+                # only get the last causal mask
+                padding_mask = padding_mask[:, :, -1, :].reshape(-1)[-nb_tokens:]
+            non_padding = ~padding_mask.bool()
+            top_1_mask = top_1_mask * non_padding.unsqueeze(-1).to(top_1_mask.dtype)
+            top_2_mask = top_2_mask * non_padding.unsqueeze(-1).to(top_1_mask.dtype)
+
+        if self.batch_prioritized_routing:
+            # sort tokens based on their routing probability
+            # to make sure important tokens are routed, first
+            importance_scores = -1 * router_probs.max(dim=1)[0]
+            sorted_top_1_mask = top_1_mask[importance_scores.argsort(dim=0)]
+            sorted_cumsum1 = (torch.cumsum(sorted_top_1_mask, dim=0) - 1) * sorted_top_1_mask
+            locations1 = sorted_cumsum1[importance_scores.argsort(dim=0).argsort(dim=0)]
+
+            sorted_top_2_mask = top_2_mask[importance_scores.argsort(dim=0)]
+            sorted_cumsum2 = (torch.cumsum(sorted_top_2_mask, dim=0) - 1) * sorted_top_2_mask
+            locations2 = sorted_cumsum2[importance_scores.argsort(dim=0).argsort(dim=0)]
+            # Update 2nd's location by accounting for locations of 1st
+            locations2 += torch.sum(top_1_mask, dim=0, keepdim=True)
+
+        else:
+            locations1 = torch.cumsum(top_1_mask, dim=0) - 1
+            locations2 = torch.cumsum(top_2_mask, dim=0) - 1
+            # Update 2nd's location by accounting for locations of 1st
+            locations2 += torch.sum(top_1_mask, dim=0, keepdim=True)
+
+        if not self.training and self.moe_eval_capacity_token_fraction > 0:
+            self.expert_capacity = math.ceil(self.moe_eval_capacity_token_fraction * nb_tokens)
+        else:
+            capacity = 2 * math.ceil(nb_tokens / self.num_experts)
+            self.expert_capacity = capacity if self.expert_capacity is None else self.expert_capacity
+
+        # Remove locations outside capacity from ( cumsum < capacity = False will not be routed)
+        top_1_mask = top_1_mask * torch.lt(locations1, self.expert_capacity)
+        top_2_mask = top_2_mask * torch.lt(locations2, self.expert_capacity)
+
+        if not self.normalize_router_prob_before_dropping:
+            top_1_max_probs, top_2_max_probs = self.normalize_router_probabilities(
+                router_probs, top_1_mask, top_2_mask
+            )
+
+        # Calculate combine_weights and dispatch_mask
+        gates1 = top_1_max_probs[:, None] * top_1_mask
+        gates2 = top_2_max_probs[:, None] * top_2_mask
+        router_probs = gates1 + gates2
+
+        return top_1_mask, router_probs
+
+    def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.LongTensor] = None) -> Tuple:
+        r"""
+        The hidden states are reshaped to simplify the computation of the router probabilities (combining weights for
+        each experts.)
+
+        Args:
+            hidden_states (`torch.Tensor`):
+                (batch_size, sequence_length, hidden_dim) from which router probabilities are computed.
+        Returns:
+            top_1_mask (`torch.Tensor` of shape (batch_size, sequence_length)):
+                Index tensor of shape [batch_size, sequence_length] corresponding to the expert selected for each token
+                using the top1 probabilities of the router.
+            router_probabilities (`torch.Tensor` of shape (batch_size, sequence_length, nump_experts)):
+                Tensor of shape (batch_size, sequence_length, num_experts) corresponding to the probabilities for each
+                token and expert. Used for routing tokens to experts.
+            router_logits (`torch.Tensor` of shape (batch_size, sequence_length))):
+                Logits tensor of shape (batch_size, sequence_length, num_experts) corresponding to raw router logits.
+                This is used later for computing router z-loss.
+        """
+        self.input_dtype = hidden_states.dtype
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.reshape((batch_size * sequence_length), hidden_dim)
+        hidden_states = hidden_states.to(self.dtype)
+        self._cast_classifier()
+        router_logits = self.classifier(hidden_states)
+        top_1_mask, router_probs = self.route_tokens(router_logits, self.input_dtype, padding_mask)
+        return top_1_mask, router_probs
+
+
+class FSGPTMoEDenseActDense(nn.Module):
+    def __init__(self, config: FSGPTMoEConfig, intermediate_size: int):
         super().__init__()
         self.fc1 = nn.Linear(config.hidden_size, intermediate_size)
         self.fc2 = nn.Linear(intermediate_size, config.hidden_size)
@@ -327,19 +505,94 @@ class FSGPTMLP(nn.Module):
     def forward(self, hidden_states):
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.act(hidden_states)
-        hidden_states = self.fc2(hidden_states)
         hidden_states = self.dropout(hidden_states)
+        if (
+                isinstance(self.fc2.weight, torch.Tensor)
+                and hidden_states.dtype != self.fc2.weight.dtype
+                and self.fc2.weight.dtype != torch.int8
+        ):
+            hidden_states = hidden_states.to(self.fc2.weight.dtype)
+        hidden_states = self.fc2(hidden_states)
         return hidden_states
 
 
-class FSGPTBlock(nn.Module):
-    def __init__(self, config: FSGPTConfig):
+class FSGPTMoESparseMLP(nn.Module):
+    r"""
+    Adapted from huggingface NLLB-MoE
+    """
+
+    def __init__(self, config: FSGPTMoEConfig, ffn_dim: int, expert_class: nn.Module = FSGPTMoEDenseActDense):
+        super().__init__()
+        self.router = FSGPTMoETop2Router(config)
+        self.moe_token_dropout = config.moe_token_dropout
+        self.token_dropout = nn.Dropout(self.moe_token_dropout)
+        self.num_experts = config.num_experts
+
+        self.experts = nn.ModuleDict()
+        for idx in range(self.num_experts):
+            self.experts[f"expert_{idx}"] = expert_class(config, ffn_dim)
+
+    def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = False):
+        r"""
+        The goal of this forward pass is to have the same number of operation as the equivalent `NllbMoeDenseActDense`
+        (mlp) layer. This means that all of the hidden states should be processed at most twice ( since we are using a
+        top_2 gating mecanism). This means that we keep the complexity to O(batch_size x sequence_length x hidden_dim)
+        instead of O(num_experts x batch_size x sequence_length x hidden_dim).
+
+        1- Get the `router_probs` from the `router`. The shape of the `router_mask` is `(batch_size X sequence_length,
+        num_expert)` and corresponds to the boolean version of the `router_probs`. The inputs are masked using the
+        `router_mask`.
+
+        2- Dispatch the hidden_states to its associated experts. The router probabilities are used to weight the
+        contribution of each experts when updating the masked hidden states.
+
+        Args:
+            hidden_states (`torch.Tensor` of shape `(batch_size, sequence_length, hidden_dim)`):
+                The hidden states
+            padding_mask (`torch.Tensor`, *optional*, defaults to `False`):
+                Attention mask. Can be in the causal form or not.
+
+        Returns:
+            hidden_states (`torch.Tensor` of shape `(batch_size, sequence_length, hidden_dim)`):
+                Updated hidden states
+            router_logits (`torch.Tensor` of shape `(batch_size, sequence_length, num_experts)`):
+                Needed for computing the loss
+
+        """
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+        top_1_mask, router_probs = self.router(hidden_states, padding_mask)
+        router_mask = router_probs.bool()
+        hidden_states = hidden_states.reshape((batch_size * sequence_length), hidden_dim)
+        masked_hidden_states = torch.einsum("bm,be->ebm", hidden_states, router_mask)
+        for idx, expert in enumerate(self.experts.values()):
+            token_indices = router_mask[:, idx]
+            combining_weights = router_probs[token_indices, idx]
+            expert_output = expert(masked_hidden_states[idx, token_indices])
+            if self.moe_token_dropout > 0:
+                if self.training:
+                    expert_output = self.token_dropout(expert_output)
+                else:
+                    expert_output *= 1 - self.moe_token_dropout
+            masked_hidden_states[idx, token_indices] = torch.einsum("b,be->be", combining_weights, expert_output)
+        hidden_states = masked_hidden_states.sum(dim=0).reshape(batch_size, sequence_length, hidden_dim)
+
+        top_1_expert_index = torch.argmax(top_1_mask, dim=-1)
+        return hidden_states, (router_probs, top_1_expert_index)
+
+
+class FSGPTMoEBlock(nn.Module):
+    def __init__(self, config: FSGPTMoEConfig, is_sparse: bool = False):
         super().__init__()
         hidden_size = config.hidden_size
         inner_dim = config.intermediate_size if config.intermediate_size is not None else 4 * hidden_size
-        self.self_attn = FSGPTSelfAttention(config)
+        self.is_sparse = is_sparse
+        self.self_attn = FSGPTMoESelfAttention(config)
         self.self_attn_layer_norm = nn.LayerNorm(hidden_size)
-        self.ffn = FSGPTMLP(config, inner_dim)
+        if self.is_sparse:
+            self.ffn = FSGPTMoESparseMLP(config, inner_dim)
+        else:
+            self.ffn = FSGPTMoEDenseActDense(config, inner_dim)
         self.final_layer_norm = nn.LayerNorm(hidden_size)
 
     def forward(
@@ -350,6 +603,7 @@ class FSGPTBlock(nn.Module):
             head_mask=None,
             use_cache=False,
             output_attentions=False,
+            output_router_logits=False,
     ):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -368,23 +622,31 @@ class FSGPTBlock(nn.Module):
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        feed_forward_hidden_states = self.ffn(hidden_states)
+
+        if self.is_sparse:
+            hidden_states, router_states = self.ffn(hidden_states, attention_mask)
+        else:
+            hidden_states, router_states = self.ffn(hidden_states), None
+
         # residual connection
-        hidden_states = residual + feed_forward_hidden_states
+        hidden_states = residual + hidden_states
 
         if use_cache:
             outputs = (hidden_states,) + outputs
         else:
             outputs = (hidden_states,) + outputs[1:]
 
-        return outputs  # hidden_states, present, (attentions, cross_attentions)
+        if output_router_logits:
+            outputs = outputs + (router_states,)
+
+        return outputs  # hidden_states, present, (attentions, cross_attentions), router_logits
 
 
-class FSGPTPreTrainedModel(PreTrainedModel):
-    config_class = FSGPTConfig
+class FSGPTMoEPreTrainedModel(PreTrainedModel):
+    config_class = FSGPTMoEConfig
     base_model_prefix = "decoder"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["FSGPTBlock"]
+    _no_split_modules = ["FSGPTMoEBlock"]
     _skip_keys_device_placement = "past_key_values"
 
     def __init__(self, *inputs, **kwargs):
@@ -413,13 +675,13 @@ class FSGPTPreTrainedModel(PreTrainedModel):
             module.gradient_checkpointing = value
 
 
-class FSGPTModel(FSGPTPreTrainedModel):
-    def __init__(self, config: FSGPTConfig):
+class FSGPTMoEModel(FSGPTMoEPreTrainedModel):
+    def __init__(self, config: FSGPTMoEConfig):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
         self.embed_tokens = nn.Embedding(config.vocab_size, self.embed_dim, padding_idx=config.pad_token_id)
-        self.embed_positions = FSGPTSinusoidalPositionalEmbedding(
+        self.embed_positions = FSGPTMoESinusoidalPositionalEmbedding(
             embedding_dim=self.embed_dim,
             padding_idx=config.pad_token_id,
             num_positions=config.max_position_embeddings,
@@ -429,7 +691,11 @@ class FSGPTModel(FSGPTPreTrainedModel):
         self.embed_scale = (
             1.0 if config.no_scale_embedding else math.sqrt(self.embed_dim)
         )
-        self.layers = nn.ModuleList([FSGPTBlock(config) for _ in range(config.num_layers)])
+        self.layers = nn.ModuleList()
+        sparse_step = config.sparse_step
+        for i in range(config.num_layers):
+            is_sparse = (i + 1) % sparse_step == 0 if sparse_step > 0 else False
+            self.layers.append(FSGPTMoEBlock(config, is_sparse=is_sparse))
         self.layer_norm = nn.LayerNorm(self.embed_dim)
 
     def get_input_embeddings(self):
@@ -450,8 +716,9 @@ class FSGPTModel(FSGPTPreTrainedModel):
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
+            output_router_logits: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-    ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPast]:
+    ) -> Union[Tuple[torch.Tensor], MoEModelOutputWithPastAndCrossAttentions]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -531,6 +798,7 @@ class FSGPTModel(FSGPTPreTrainedModel):
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+        all_router_probs = () if output_router_logits else None
         for i, (block, layer_past) in enumerate(zip(self.layers, past_key_values)):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -542,6 +810,7 @@ class FSGPTModel(FSGPTPreTrainedModel):
                 head_mask=head_mask[i],
                 use_cache=use_cache,
                 output_attentions=output_attentions,
+                output_router_logits=output_router_logits,
             )
 
             hidden_states = outputs[0]
@@ -551,6 +820,9 @@ class FSGPTModel(FSGPTPreTrainedModel):
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
 
+            if output_router_logits:
+                all_router_probs += (outputs[-1],)
+
         hidden_states = self.layer_norm(hidden_states)
 
         hidden_states = hidden_states.view(output_shape)
@@ -559,22 +831,31 @@ class FSGPTModel(FSGPTPreTrainedModel):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
+            return tuple(
+                v for v in
+                [hidden_states,
+                 presents,
+                 all_hidden_states,
+                 all_self_attentions,
+                 all_router_probs]
+                if v is not None
+            )
 
-        return BaseModelOutputWithPast(
+        return MoEModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=presents,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
+            router_probs=all_router_probs
         )
 
 
-class FSGPTForCausalLM(FSGPTPreTrainedModel):
+class FSGPTMoEForCausalLM(FSGPTMoEPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: FSGPTConfig):
+    def __init__(self, config: FSGPTMoEConfig):
         super().__init__(config)
-        self.decoder = FSGPTModel(config)
+        self.decoder = FSGPTMoEModel(config)
         # Share input output embeddings
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.decoder.embed_tokens.weight
@@ -634,8 +915,9 @@ class FSGPTForCausalLM(FSGPTPreTrainedModel):
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
+            output_router_logits: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-    ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithPast]:
+    ) -> Union[Tuple[torch.Tensor], MoECausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
@@ -643,6 +925,13 @@ class FSGPTForCausalLM(FSGPTPreTrainedModel):
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
 
         transformer_outputs = self.decoder(
             input_ids,
@@ -655,6 +944,7 @@ class FSGPTForCausalLM(FSGPTPreTrainedModel):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
             return_dict=return_dict,
         )
         hidden_states = transformer_outputs[0]
@@ -683,12 +973,13 @@ class FSGPTForCausalLM(FSGPTPreTrainedModel):
             output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return MoECausalLMOutputWithPast(
             loss=loss,
             logits=lm_logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
+            router_logits=transformer_outputs.router_probs,
         )
 
     @staticmethod
