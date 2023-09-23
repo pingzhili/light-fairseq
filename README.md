@@ -6,8 +6,8 @@ This repo contains Hugging Face transformers-style conversions of some Fairseq m
 
 GPT-like SMoE and dense model checkpoints from [arXiv:2112.10684](https://arxiv.org/abs/2112.10684)
 
-- [x] en_dense_lm_125m
-- [x] en_moe_lm_15b
+- [x] `en_dense_lm_125m`: "Phando/fairseq-dense-125m"
+- [x] `en_moe_lm_15b`: "Phando/fairseq-moe-15b"
 
 
 
