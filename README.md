@@ -1,6 +1,6 @@
 # Light Fairseq
 
-Re-implement Fairseq models in the Huggingface-style
+This repo contains Hugging Face transformers-style conversions of some Fairseq model checkpoints
 
 ## 1. Checkpoints
 
