@@ -4,7 +4,7 @@ Re-implement Fairseq models in the Huggingface-style
 
 ## 1. Checkpoints
 
-### 1.1. GPT Dense&SMoE from arXiv:2112.10684
+### 1.1. GPT Dense&SMoE in [arXiv:2112.10684](https://arxiv.org/abs/2112.10684)
 
 - [x] en_dense_lm_125m
 - [x] en_moe_lm_15b
