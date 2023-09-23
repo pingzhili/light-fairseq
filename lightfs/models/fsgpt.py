@@ -142,8 +142,8 @@ class FSGPTSinusoidalPositionalEmbedding(nn.Module):
         if embedding_dim % 2 == 1:
             # zero pad
             emb = torch.cat([emb, torch.zeros(num_embeddings, 1)], dim=1)
-        # if padding_idx is not None:
-        #     emb[padding_idx, :] = 0
+        if padding_idx is not None:
+            emb[padding_idx, :] = 0
         return emb
 
     def forward(
@@ -420,9 +420,9 @@ class FSGPTModel(FSGPTPreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, self.embed_dim, padding_idx=config.pad_token_id)
         self.embed_positions = FSGPTSinusoidalPositionalEmbedding(
             embedding_dim=self.embed_dim,
-            padding_idx=config.pad_token_id,
-            init_size=config.max_position_embeddings + 1 + config.pad_token_id,
-        )
+            padding_idx=1,
+            init_size=config.max_position_embeddings + 2,
+        )  # weird but follows fairseq
         self.drop = nn.Dropout(float(config.embed_dropout))
 
         self.embed_scale = (
