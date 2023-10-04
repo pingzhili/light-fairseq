@@ -14,16 +14,14 @@ Re-implement Fairseq models in the Huggingface-style
 ## 2. Example usage:
 
 ```python
-from lightfs.models import FSGPTForCausalLM
+from lightfs import FSGPTForCausalLM
 
 # load `en_dense_lm_125m` from 🤗Huggingface model hub
 model = FSGPTForCausalLM.from_pretrained("Phando/fairseq-dense-125m")
 ```
 
 ```python
-import torch
-
-from lightfs.models import FSGPTMoEForCausalLM
+from lightfs import FSGPTMoEForCausalLM
 
 # load `en_moe_lm_15b` from 🤗Huggingface model hub, with 🤗Accelerate MP and bf16
 model = FSGPTMoEForCausalLM.from_pretrained("Phando/fairseq-moe-15b",
