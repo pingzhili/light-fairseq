@@ -1,13 +1,13 @@
 # Light Fairseq
 
-Re-implement Fairseq models in the Huggingface-style
+This repo contains Hugging Face transformers-style conversions of some Fairseq model checkpoints
 
 ## 1. Checkpoints
 
-### 1.1. GPT Dense&SMoE in [arXiv:2112.10684](https://arxiv.org/abs/2112.10684)
+GPT-like SMoE and dense model checkpoints from [arXiv:2112.10684](https://arxiv.org/abs/2112.10684)
 
-- [x] en_dense_lm_125m
-- [x] en_moe_lm_15b
+- [x] `en_dense_lm_125m`: "Phando/fairseq-dense-125m"
+- [x] `en_moe_lm_15b`: "Phando/fairseq-moe-15b" / "Phando/fairseq-moe-15b-bf16"
 
 
 
@@ -24,6 +24,5 @@ model = FSGPTForCausalLM.from_pretrained("Phando/fairseq-dense-125m")
 from lightfs import FSGPTMoEForCausalLM
 
 # load `en_moe_lm_15b` from 🤗Huggingface model hub, with 🤗Accelerate MP and bf16
-model = FSGPTMoEForCausalLM.from_pretrained("Phando/fairseq-moe-15b",
-                                            device_map="auto", torch_dtype=torch.bfloat16)
+model = FSGPTMoEForCausalLM.from_pretrained("Phando/fairseq-moe-15b-bf16", device_map="auto")
 ```
