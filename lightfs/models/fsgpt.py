@@ -189,7 +189,7 @@ class FSGPTSinusoidalPositionalEmbedding(nn.Module):
             )
             return embeddings
         return (
-            self.weights.index_select(0, positions.view(-1))
+            self.weights.index_select(0, positions.to(self.weights.device).view(-1))
             .view(bsz, seq_len, -1)
             .detach()
         )
